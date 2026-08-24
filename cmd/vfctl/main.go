@@ -668,7 +668,7 @@ func cmdWatch(args []string) error {
 		w = csv.NewWriter(fh)
 		if err := w.Write([]string{
 			"unix_ns", "elapsed", "core_mhz", "mem_mhz", "volt_mv",
-			"point_mv", "offset_mhz", "read_error",
+			"point_mv", "offset_mhz", "util_pct", "temp_c", "power_w", "read_error",
 		}); err != nil {
 			return err
 		}
@@ -679,8 +679,8 @@ func cmdWatch(args []string) error {
 	if *csvPath != "" {
 		fmt.Printf("logging to %s\n", *csvPath)
 	}
-	fmt.Printf("%8s %9s %9s %8s %9s\n", "elapsed", "core MHz", "volt mV", "point mV", "offset MHz")
-	fmt.Println(strings.Repeat("-", 48))
+	fmt.Printf("%8s %9s %9s %8s %9s %7s %6s %7s\n", "elapsed", "core MHz", "volt mV", "point mV", "offset MHz", "util%", "tempC", "power W")
+	fmt.Println(strings.Repeat("-", 70))
 
 	// Per-voltage histogram accumulation (when --summary).
 	buckets := make(map[int]*summaryBucket)
@@ -701,12 +701,12 @@ loop:
 		}
 
 		sample := time.Now()
-		clk, clkErr := sess.ReadClocks()
-		volt, voltErr := sess.ReadVoltage()
+		telem, terr := sess.ReadTelemetry()
 
 		// Nearest VF point to current voltage, for the applied offset.
 		var nearest nvapi.VFPoint
 		best := 1e9
+		volt := uint32(telem.VoltageMV * 1000)
 		points, _ := sess.ReadCurve()
 		for _, p := range points {
 			d := float64(p.VoltageUV)/1000 - float64(volt)/1000
@@ -720,26 +720,27 @@ loop:
 		}
 
 		readErr := ""
-		if clkErr != nil {
-			readErr = clkErr.Error()
-		} else if voltErr != nil {
-			readErr = voltErr.Error()
+		if terr != nil {
+			readErr = terr.Error()
 		}
 
 		// Console line.
-		if clkErr != nil {
-			fmt.Printf("%8s %s\n", time.Since(start).Round(time.Second), clkErr)
+		if terr != nil && telem.CoreKHz == 0 {
+			fmt.Printf("%8s %s\n", time.Since(start).Round(time.Second), terr)
 		} else {
-			fmt.Printf("%8s %9.0f %9.0f %8.0f %+9.0f\n",
+			fmt.Printf("%8s %9.0f %9.0f %8.0f %+9.0f %6d %6.0f %7.1f\n",
 				time.Since(start).Round(time.Second),
-				float64(clk.CoreKHz)/1000,
-				float64(volt)/1000,
+				float64(telem.CoreKHz)/1000,
+				telem.VoltageMV,
 				float64(nearest.VoltageUV)/1000,
-				float64(nearest.OffsetKHz)/1000)
+				float64(nearest.OffsetKHz)/1000,
+				telem.UtilPct,
+				telem.TempC,
+				telem.PowerW)
 		}
 
 		// Accumulate for summary.
-		if *summary && clkErr == nil && voltErr == nil {
+		if *summary && terr == nil {
 			mv := int(volt / 1000)
 			b, ok := buckets[mv]
 			if !ok {
@@ -748,7 +749,7 @@ loop:
 			}
 			b.n++
 			totalSamples++
-			c := float64(clk.CoreKHz) / 1000
+			c := float64(telem.CoreKHz) / 1000
 			if c < b.coreMin {
 				b.coreMin = c
 			}
@@ -763,11 +764,14 @@ loop:
 			row := []string{
 				strconv.FormatInt(sample.UnixNano(), 10),
 				strconv.FormatFloat(time.Since(start).Seconds(), 'f', 3, 64),
-				strconv.FormatFloat(float64(clk.CoreKHz)/1000, 'f', 1, 64),
-				strconv.FormatFloat(float64(clk.MemoryKHz)/1000, 'f', 1, 64),
-				strconv.FormatFloat(float64(volt)/1000, 'f', 1, 64),
+				strconv.FormatFloat(float64(telem.CoreKHz)/1000, 'f', 1, 64),
+				strconv.FormatFloat(float64(telem.MemKHz)/1000, 'f', 1, 64),
+				strconv.FormatFloat(telem.VoltageMV, 'f', 1, 64),
 				strconv.FormatFloat(float64(nearest.VoltageUV)/1000, 'f', 0, 64),
 				strconv.FormatFloat(float64(nearest.OffsetKHz)/1000, 'f', 1, 64),
+				strconv.FormatUint(uint64(telem.UtilPct), 10),
+				strconv.FormatFloat(telem.TempC, 'f', 1, 64),
+				strconv.FormatFloat(telem.PowerW, 'f', 1, 64),
 				readErr,
 			}
 			if err := w.Write(row); err != nil {

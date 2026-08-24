@@ -25,6 +25,7 @@ package nvapi
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -455,7 +456,125 @@ func (s *Session) ReadClocks() (CurrentClocks, error) {
 	return CurrentClocks{CoreKHz: freq(domainGraphics), MemoryKHz: freq(domainMemory)}, nil
 }
 
-// errorText looks up an NVAPI error message.
+// Telemetry holds a single sampling of live GPU state.
+type Telemetry struct {
+	CoreKHz   uint32
+	MemKHz    uint32
+	VoltageMV float64 // from ClientVoltRailsGetStatus
+	UtilPct   uint32  // GPU utilization % (DynamicPstatesInfoEx domain 0)
+	TempC     float64 // NV_GPU_THERMAL_SETTINGS sensor 0 (core)
+	PowerW    float64 // NV_GPU_CLIENT_POWER_POLICIES_STATUS (board, mW)
+}
+
+// ReadTelemetry samples clock, voltage, utilization, temp, and power.
+// Each sub-read is independent; failures surface per-field as zero + error.
+func (s *Session) ReadTelemetry() (Telemetry, error) {
+	var t Telemetry
+	var errs []string
+
+	if c, err := s.ReadClocks(); err == nil {
+		t.CoreKHz = c.CoreKHz
+		t.MemKHz = c.MemoryKHz
+	} else {
+		errs = append(errs, "clock: "+err.Error())
+	}
+
+	if v, err := s.ReadVoltage(); err == nil {
+		t.VoltageMV = float64(v) / 1000
+	} else {
+		errs = append(errs, "volt: "+err.Error())
+	}
+
+	if u, err := s.readUtilization(); err == nil {
+		t.UtilPct = u
+	} else {
+		errs = append(errs, "util: "+err.Error())
+	}
+
+	if tp, err := s.readTemp(); err == nil {
+		t.TempC = tp
+	} else {
+		errs = append(errs, "temp: "+err.Error())
+	}
+
+	if p, err := s.readPower(); err == nil {
+		t.PowerW = p
+	} else {
+		errs = append(errs, "power: "+err.Error())
+	}
+
+	if len(errs) > 0 {
+		return t, fmt.Errorf("partial: %s", strings.Join(errs, "; "))
+	}
+	return t, nil
+}
+
+// readUtilization via NvAPI_GPU_GetDynamicPstatesInfoEx (0x60DED2ED).
+// Struct NV_GPU_DYNAMIC_PSTATES_INFO_EX: version(u32) flags(u32)
+// utilization[8] each { bIsPresent u32, percentage u32 }. GPU domain = 0.
+func (s *Session) readUtilization() (uint32, error) {
+	const idGetDynamicPstatesInfoEx = 0x60DED2ED
+	fn, err := queryInterface(idGetDynamicPstatesInfoEx)
+	if err != nil {
+		return 0, err
+	}
+	buf := make([]byte, 8+8*8) // version+flags + 8 domains x 8 bytes
+	binary.LittleEndian.PutUint32(buf[0:], makeVersion(1, uint32(len(buf))))
+	if ret, _ := call(fn, uintptr(s.gpu), uintptr(unsafe.Pointer(&buf[0]))); ret != NVAPI_OK {
+		return 0, fmt.Errorf("GetDynamicPstatesInfoEx failed: %d", ret)
+	}
+	return binary.LittleEndian.Uint32(buf[8+4:]), nil // domain 0 percentage
+}
+
+// readTemp via NvAPI_GPU_GetThermalSettings (0xE3640A56).
+// Function signature takes THREE args: (gpu, sensorIndex, struct).
+// sensorIndex 0 = first sensor (GPU core on most cards).
+// Struct NV_GPU_THERMAL_SETTINGS_V2: version(u32) count(u32)
+// sensor[3] each { controller u32, defaultMinTemp i32, defaultMaxTemp i32,
+// currentTemp i32, target u32 } = 20 bytes each.
+// Core temp = sensor[0].currentTemp @ offset 8 + 12 = 20.
+func (s *Session) readTemp() (float64, error) {
+	const idGetThermalSettings = 0xE3640A56
+	fn, err := queryInterface(idGetThermalSettings)
+	if err != nil {
+		return 0, err
+	}
+	buf := make([]byte, 8+3*20) // version+count + 3 sensors x 20 bytes
+	binary.LittleEndian.PutUint32(buf[0:], makeVersion(2, uint32(len(buf))))
+	// Missing the sensorIndex argument was why this returned 0 silently.
+	if ret, _ := call(fn, uintptr(s.gpu), 0, uintptr(unsafe.Pointer(&buf[0]))); ret != NVAPI_OK {
+		return 0, fmt.Errorf("GetThermalSettings failed: %d", ret)
+	}
+	return float64(int32(binary.LittleEndian.Uint32(buf[20:]))), nil // sensor[0].currentTemp
+}
+
+// readPower via NvAPI_GPU_ClientPowerPoliciesGetStatus (0x70916171).
+// Struct NV_GPU_POWER_STATUS_V1 (from nvapi-sys gpu/power.rs):
+//
+//	version: u32
+//	count: u32
+//	entries[4]: each { a u32, b u32, power u32, d u32 } = 16 bytes
+//
+// power is the THIRD u32 in each entry (+8), entries are 16 bytes.
+// Total struct = 8 + 4*16 = 72 bytes. Values are mW.
+func (s *Session) readPower() (float64, error) {
+	const idClientPowerPoliciesGetStatus = 0x70916171
+	fn, err := queryInterface(idClientPowerPoliciesGetStatus)
+	if err != nil {
+		return 0, err
+	}
+	buf := make([]byte, 8+4*16) // version+count + 4 entries x 16 bytes
+	binary.LittleEndian.PutUint32(buf[0:], makeVersion(1, uint32(len(buf))))
+	if ret, _ := call(fn, uintptr(s.gpu), uintptr(unsafe.Pointer(&buf[0]))); ret != NVAPI_OK {
+		return 0, fmt.Errorf("ClientPowerPoliciesGetStatus failed: %d", ret)
+	}
+	count := binary.LittleEndian.Uint32(buf[4:])
+	var totalMw uint64
+	for i := uint32(0); i < count && i < 4; i++ {
+		totalMw += uint64(binary.LittleEndian.Uint32(buf[8+i*16+8:])) // entry.power @ +8
+	}
+	return float64(totalMw) / 1000, nil
+}
 func errorText(status int32) string {
 	fn, err := queryInterface(idGetErrorMessage)
 	if err != nil {

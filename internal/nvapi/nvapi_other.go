@@ -51,3 +51,17 @@ type CurrentClocks struct {
 func (s *Session) ReadClocks() (CurrentClocks, error) {
 	return CurrentClocks{}, fmt.Errorf("nvapi: only available on Windows")
 }
+
+// Telemetry holds a single sampling of live GPU state.
+type Telemetry struct {
+	CoreKHz   uint32
+	MemKHz    uint32
+	VoltageMV float64
+	UtilPct   uint32
+	TempC     float64
+	PowerW    float64
+}
+
+func (s *Session) ReadTelemetry() (Telemetry, error) {
+	return Telemetry{}, fmt.Errorf("nvapi: only available on Windows")
+}
