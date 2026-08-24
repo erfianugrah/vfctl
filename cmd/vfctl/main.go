@@ -19,13 +19,13 @@ import (
 	"os"
 	"os/exec"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/erfianugrah/vfctl/internal/curve"
 	"github.com/erfianugrah/vfctl/internal/nvapi"
 	"github.com/erfianugrah/vfctl/internal/profile"
+	"github.com/erfianugrah/vfctl/internal/testloop"
 	"github.com/erfianugrah/vfctl/internal/vfcurve"
 )
 
@@ -552,11 +552,7 @@ func countTDR() (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
-	if err != nil {
-		return -1, err
-	}
-	return n, nil
+	return testloop.ParseTDRCount(string(out))
 }
 
 // cmdSelfTest proves the NVAPI write path end-to-end on the live card without
@@ -646,11 +642,11 @@ func cmdTest(args []string) error {
 		return fmt.Errorf("--voltage, --freq, and --game are required")
 	}
 	if *minFreq == 0 {
-		*minFreq = *freq - float64(*maxSteps)*15
+		*minFreq = testloop.MinFreqFloor(*freq, *maxSteps)
 	}
 
 	for step := 0; ; step++ {
-		f := *freq - float64(step)*15
+		f := testloop.StepFreq(*freq, step)
 		if f < *minFreq {
 			return fmt.Errorf("stepped down to %.0f MHz (below --min-freq) with no stable result", f)
 		}
