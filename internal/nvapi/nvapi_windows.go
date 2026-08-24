@@ -72,9 +72,13 @@ const (
 	ctrlPointsOffset   = 0x44
 	// Within a control point: type_(4) + rsvd(16) + prog.freq_offset_khz.
 	ctrlFreqOffsetKHz = 20
-	// Within a status point: type_(4) freq_khz(4) voltage_uv(8).
-	statusFreqKHz   = 4
-	statusVoltageUV = 8
+	// Within a status point: type_(4) freq_khz(4) voltage_uv(8), then
+	// vf_tuple_base (freq@12, volt@16) and vf_tuple_offset (freq@52, volt@56).
+	// The BASE frequency we need for offset math is vf_tuple_base.freq_khz at
+	// +12; freq_khz at +4 is the NOMINAL (base + applied offset) frequency.
+	statusFreqKHz     = 4 // nominal (base + offset), display only
+	statusVoltageUV   = 8
+	statusBaseFreqKHz = 12 // vf_tuple_base.freq_khz - the true vBIOS base
 	// Within an info point: type_(4) b_voltage_based(1).
 	infoType         = 0
 	infoVoltageBased = 4
@@ -110,6 +114,7 @@ type Session struct {
 	gpuName string
 	inited  bool
 	mask    [maskLen]byte // active-point mask from GetInfo
+	core    []int         // editable core VF point indices
 }
 
 // Probe reports available interfaces.
@@ -193,10 +198,11 @@ func (s *Session) GPUName() string { return s.gpuName }
 
 // VFPoint is one voltage/frequency point.
 type VFPoint struct {
-	Index     int
-	FreqKHz   uint32
-	VoltageUV uint32
-	OffsetKHz int32
+	Index      int
+	FreqKHz    uint32 // vBIOS base frequency (offset math uses this)
+	NominalKHz uint32 // nominal = base + applied offset (display)
+	VoltageUV  uint32
+	OffsetKHz  int32
 }
 
 // makeVersion packs version and size.
@@ -204,7 +210,10 @@ func makeVersion(ver, size uint32) uint32 {
 	return (ver << 16) | (size & 0xFFFF)
 }
 
-// loadMask reads the active-point mask via GetInfo and stores it on the session.
+// loadMask reads the active-point mask AND the per-point type/voltage-based
+// flags via GetInfo. Only core VF points (type==0 && voltage_based==1) are
+// editable; the buffer also carries other clock domains (memory, etc.) whose
+// offsets we must never touch.
 func (s *Session) loadMask() error {
 	fn, err := queryInterface(idClkVfPointsGetInfo)
 	if err != nil {
@@ -216,7 +225,38 @@ func (s *Session) loadMask() error {
 		return fmt.Errorf("ClkVfPointsGetInfo failed: %d (%s)", ret, errorText(ret))
 	}
 	copy(s.mask[:], buf[maskOffset:maskOffset+maskLen])
+
+	// Record which indices are editable core points.
+	s.core = nil
+	for i := 0; i < pointCount; i++ {
+		off := infoPointsOffset + i*infoStride
+		typ := binary.LittleEndian.Uint32(buf[off+infoType:])
+		vb := buf[off+infoVoltageBased]
+		if typ == 0 && vb == 1 {
+			s.core = append(s.core, i)
+		}
+	}
 	return nil
+}
+
+// coreIndices returns the editable core VF point indices (type==0,
+// voltage_based==1). Falls back to the raw active mask if the info flags
+// were not populated (older drivers).
+func (s *Session) coreIndices() []int {
+	if len(s.core) > 0 {
+		return s.core
+	}
+	return s.activeIndices()
+}
+
+// isCore reports whether a point index is an editable core VF point.
+func (s *Session) isCore(pointIndex int) bool {
+	for _, i := range s.coreIndices() {
+		if i == pointIndex {
+			return true
+		}
+	}
+	return false
 }
 
 // activeIndices returns the point indices set in the active-point mask.
@@ -259,18 +299,25 @@ func (s *Session) ReadCurve() ([]VFPoint, error) {
 	}
 
 	points := make([]VFPoint, 0, pointCount)
-	for _, i := range s.activeIndices() {
+	for _, i := range s.coreIndices() {
 		off := statusPointsOffset + i*statusStride
 		freq := binary.LittleEndian.Uint32(buf[off+statusFreqKHz:])
+		base := binary.LittleEndian.Uint32(buf[off+statusBaseFreqKHz:])
 		volt := binary.LittleEndian.Uint32(buf[off+statusVoltageUV:])
-		if freq == 0 && volt == 0 {
+		if base == 0 && freq == 0 && volt == 0 {
 			continue
 		}
+		// Fall back to nominal if the base tuple is not populated (some
+		// drivers leave vf_tuple_base zero).
+		if base == 0 {
+			base = freq
+		}
 		points = append(points, VFPoint{
-			Index:     i,
-			FreqKHz:   freq,
-			VoltageUV: volt,
-			OffsetKHz: offsets[i],
+			Index:      i,
+			FreqKHz:    base,
+			NominalKHz: freq,
+			VoltageUV:  volt,
+			OffsetKHz:  offsets[i],
 		})
 	}
 	return points, nil
@@ -307,6 +354,9 @@ func (s *Session) SetOffset(pointIndex int, offsetKHz int32) error {
 	}
 	if pointIndex < 0 || pointIndex >= pointCount {
 		return fmt.Errorf("nvapi: point index %d out of range", pointIndex)
+	}
+	if !s.isCore(pointIndex) {
+		return fmt.Errorf("nvapi: point %d is not an editable core VF point (type!=0 or not voltage-based); refusing to write", pointIndex)
 	}
 
 	// Read current control table.

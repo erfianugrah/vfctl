@@ -443,6 +443,9 @@ func cmdSet(args []string) error {
 	if err := sess.SetAllOffsets(offsets); err != nil {
 		return err
 	}
+	if err := curve.VerifyOffsets(sess, offsets); err != nil {
+		return fmt.Errorf("curve did not fully apply (offsets are volatile; re-run set or reset to stock): %w", err)
+	}
 	fmt.Println("Done")
 	return nil
 }
