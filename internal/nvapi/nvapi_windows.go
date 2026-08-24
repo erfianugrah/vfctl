@@ -548,8 +548,12 @@ func (s *Session) readTemp() (float64, error) {
 	return float64(int32(binary.LittleEndian.Uint32(buf[20:]))), nil // sensor[0].currentTemp
 }
 
-// readPower via NvAPI_GPU_ClientPowerPoliciesGetStatus (0x70916171).
-// Struct NV_GPU_POWER_STATUS_V1 (from nvapi-sys gpu/power.rs):
+// readPower via NvAPI_GPU_ClientPowerTopologyGetStatus (0xEDCF624E).
+// This is the LIVE power draw API (nvapi-rs power_usage()); the similar
+// ClientPowerPoliciesGetStatus returns the policy/limit (frozen ~100%), not
+// instantaneous draw - do not use it for telemetry.
+//
+// Struct NV_GPU_POWER_TOPO_V1 (from nvapi-sys gpu/power.rs):
 //
 //	version: u32
 //	count: u32
@@ -558,15 +562,15 @@ func (s *Session) readTemp() (float64, error) {
 // power is the THIRD u32 in each entry (+8), entries are 16 bytes.
 // Total struct = 8 + 4*16 = 72 bytes. Values are mW.
 func (s *Session) readPower() (float64, error) {
-	const idClientPowerPoliciesGetStatus = 0x70916171
-	fn, err := queryInterface(idClientPowerPoliciesGetStatus)
+	const idClientPowerTopologyGetStatus = 0xEDCF624E
+	fn, err := queryInterface(idClientPowerTopologyGetStatus)
 	if err != nil {
 		return 0, err
 	}
 	buf := make([]byte, 8+4*16) // version+count + 4 entries x 16 bytes
 	binary.LittleEndian.PutUint32(buf[0:], makeVersion(1, uint32(len(buf))))
 	if ret, _ := call(fn, uintptr(s.gpu), uintptr(unsafe.Pointer(&buf[0]))); ret != NVAPI_OK {
-		return 0, fmt.Errorf("ClientPowerPoliciesGetStatus failed: %d", ret)
+		return 0, fmt.Errorf("ClientPowerTopologyGetStatus failed: %d (%s)", ret, errorText(ret))
 	}
 	count := binary.LittleEndian.Uint32(buf[4:])
 	var totalMw uint64
