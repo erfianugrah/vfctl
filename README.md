@@ -27,7 +27,52 @@ Built for an RTX 5090 FE after Afterburner's editor repeatedly produced broken c
 
 # Reset to stock
 .\vfctl.exe reset
+
+# Persist across reboots (installs a sign-in task)
+.\vfctl.exe persist --voltage 900 --freq 2797
+
+# Automate stability search: step down 15 MHz on each TDR
+.\vfctl.exe test --voltage 900 --freq 2812 --game "C:\path\to\game.exe" --min-freq 2700 --run-for 30m
 ```
+
+## Persistence
+
+NVAPI offsets are volatile - they live in driver memory and reset on reboot or
+TDR. `persist` installs a Windows scheduled task (`vfctl-undervolt`, logon,
+elevated) that re-runs `vfctl set` at every sign-in. Because `set` reads the
+live curve at apply time, it is temperature-correct each boot - no stale
+baseline.
+
+```powershell
+.\vfctl.exe persist --voltage 900 --freq 2797   # install
+.\vfctl.exe persist --remove                    # remove
+```
+
+## Automated stability testing
+
+`test` runs the apply-then-crash loop: apply a curve, launch the game, watch
+for a TDR (Windows Event 4101, nvlddmkm) or a non-zero process exit, and step
+down 15 MHz on failure. It stops at the first curve that survives `--run-for`
+without a TDR, or at `--min-freq`.
+
+```powershell
+.\vfctl.exe test --voltage 900 --freq 2812 --game "C:\games\thefinals.exe"
+```
+
+- A clean exit (exit code 0) also stops the loop - treat it as accepted
+- A hard hang/BSOD can't be caught in-process; the machine reboots and you
+  re-run from the last-known-good frequency
+- For games with no benchmark mode, play normally: a TDR auto-steps down and
+  relaunches
+
+## Telemetry (HWiNFO)
+
+The crash loop needs no sensors - the TDR event IS the stability signal. Use
+HWiNFO for verification telemetry: confirm the card actually runs at the target
+voltage/frequency under load and check hotspot temperature. Enable Shared
+Memory Support and CSV-log during a session (green + button), then compare
+against the curve. Note: shared-memory access is time-limited on the free
+version (12 hours); a Pro license lifts it.
 
 ## Afterburner cfg mode (Linux/WSL)
 

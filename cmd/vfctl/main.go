@@ -17,8 +17,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/erfianugrah/vfctl/internal/nvapi"
 	"github.com/erfianugrah/vfctl/internal/profile"
@@ -57,6 +60,10 @@ func main() {
 		err = cmdSet(args)
 	case "reset":
 		err = cmdReset(args)
+	case "persist":
+		err = cmdPersist(args)
+	case "test":
+		err = cmdTest(args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", cmd)
 		usage()
@@ -86,6 +93,10 @@ Commands:
   set       --voltage 900 --freq 2797 [--ramp-from 850]
             Apply undervolt directly via NVAPI, bypassing Afterburner (Windows only)
   reset     Zero all VF point offsets (return to stock curve)
+  persist   --voltage 900 --freq 2797 [--ramp-from 850] [--remove]
+            Install a scheduled task that re-applies the curve at sign-in (admin)
+  test      --voltage 900 --freq 2812 --game path.exe [--min-freq N] [--run-for 30m]
+            Apply, launch the game, watch for TDR; step down 15 MHz on crash (admin)
 `)
 }
 
@@ -400,40 +411,17 @@ func cmdSet(args []string) error {
 		return err
 	}
 
-	// Find stock frequency at target voltage
-	var stockAtTarget float64
-	for _, p := range points {
-		mv := float64(p.VoltageUV) / 1000
-		if mv == *voltage {
-			stockAtTarget = float64(p.FreqKHz) / 1000
-			break
-		}
-	}
-	if stockAtTarget == 0 {
+	stockAtTarget, ok := stockAt(points, *voltage)
+	if !ok {
 		return fmt.Errorf("no VF point at %.0fmV", *voltage)
 	}
 
 	fmt.Printf("Live stock @ %.0fmV: %.0f MHz\n", *voltage, stockAtTarget)
 	fmt.Printf("Target: %.0f MHz (offset %+.0f MHz)\n", *freq, *freq-stockAtTarget)
 
-	// Build offset map
-	offsets := make(map[int]int32)
-	for _, p := range points {
-		mv := float64(p.VoltageUV) / 1000
-		var target float64
-		switch {
-		case mv < *rampFrom:
-			continue // untouched
-		case mv < *voltage:
-			// Ramp
-			t := (mv - *rampFrom) / (*voltage - *rampFrom)
-			target = float64(p.FreqKHz)/1000 + t*(*freq-stockAtTarget)
-		default:
-			// Flatten
-			target = *freq
-		}
-		offset := target - float64(p.FreqKHz)/1000
-		offsets[p.Index] = int32(offset * 1000) // kHz
+	offsets, err := buildOffsets(points, *voltage, *freq, *rampFrom)
+	if err != nil {
+		return err
 	}
 
 	if *dryRun {
@@ -503,4 +491,196 @@ func cmdReset(args []string) error {
 	}
 	fmt.Println("Done - back to stock curve")
 	return nil
+}
+
+// stockAt returns the live stock frequency (MHz) at a voltage point.
+func stockAt(points []nvapi.VFPoint, voltage float64) (float64, bool) {
+	for _, p := range points {
+		if float64(p.VoltageUV)/1000 == voltage {
+			return float64(p.FreqKHz) / 1000, true
+		}
+	}
+	return 0, false
+}
+
+// buildOffsets computes per-point offsets (kHz) for a ramp-then-flatten curve.
+func buildOffsets(points []nvapi.VFPoint, voltage, freq, rampFrom float64) (map[int]int32, error) {
+	stock, ok := stockAt(points, voltage)
+	if !ok {
+		return nil, fmt.Errorf("no VF point at %.0fmV", voltage)
+	}
+	offsets := make(map[int]int32)
+	for _, p := range points {
+		mv := float64(p.VoltageUV) / 1000
+		var target float64
+		switch {
+		case mv < rampFrom:
+			continue // below ramp: untouched
+		case mv < voltage:
+			t := (mv - rampFrom) / (voltage - rampFrom)
+			target = float64(p.FreqKHz)/1000 + t*(freq-stock)
+		default:
+			target = freq
+		}
+		offsets[p.Index] = int32((target - float64(p.FreqKHz)/1000) * 1000)
+	}
+	return offsets, nil
+}
+
+// applyCurve opens NVAPI, reads the live curve, and writes the offsets.
+func applyCurve(voltage, freq, rampFrom float64) error {
+	sess, err := nvapi.Init()
+	if err != nil {
+		return err
+	}
+	defer sess.Close()
+	points, err := sess.ReadCurve()
+	if err != nil {
+		return err
+	}
+	offsets, err := buildOffsets(points, voltage, freq, rampFrom)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("applying %.0f MHz @ %.0f mV (%d points)...\n", freq, voltage, len(offsets))
+	return sess.SetAllOffsets(offsets)
+}
+
+// cmdPersist installs (or removes) a scheduled task that re-applies the curve
+// at sign-in. NVAPI offsets are volatile - they live in driver memory and are
+// lost on reboot or driver reset. A logon task re-runs `vfctl set`, which reads
+// the live curve, so it is temperature-correct at every boot.
+func cmdPersist(args []string) error {
+	fs := flag.NewFlagSet("persist", flag.ExitOnError)
+	voltage := fs.Float64("voltage", 0, "target voltage (mV)")
+	freq := fs.Float64("freq", 0, "target frequency (MHz)")
+	rampFrom := fs.Float64("ramp-from", 850, "ramp start voltage (mV)")
+	remove := fs.Bool("remove", false, "remove the scheduled task")
+	fs.Parse(args)
+
+	const taskName = "vfctl-undervolt"
+
+	if *remove {
+		out, err := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("schtasks delete: %v: %s", err, out)
+		}
+		fmt.Printf("removed scheduled task %s\n", taskName)
+		return nil
+	}
+
+	if *voltage == 0 || *freq == 0 {
+		return fmt.Errorf("--voltage and --freq are required (or --remove)")
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate self: %w", err)
+	}
+	tr := fmt.Sprintf(`"%s" set --voltage %.0f --freq %.0f --ramp-from %.0f`, exe, *voltage, *freq, *rampFrom)
+
+	// /RL HIGHEST runs elevated; /SC ONLOGON fires at sign-in.
+	out, err := exec.Command("schtasks", "/Create", "/TN", taskName, "/SC", "ONLOGON",
+		"/RL", "HIGHEST", "/TR", tr, "/F").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("schtasks create: %v: %s", err, out)
+	}
+	fmt.Printf("installed %s -> %s\n", taskName, tr)
+	fmt.Println("curve re-applied at every sign-in (elevated)")
+	return nil
+}
+
+// countTDR returns the number of TDR events (Event ID 4101, nvlddmkm) in the
+// System log. Returns -1 on error.
+func countTDR() (int, error) {
+	out, err := exec.Command("powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
+		`(Get-WinEvent -FilterHashtable @{LogName='System'; Id=4101} -ErrorAction SilentlyContinue | Measure-Object).Count`).Output()
+	if err != nil {
+		return -1, err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return -1, err
+	}
+	return n, nil
+}
+
+// cmdTest automates stability search: apply a curve, launch the game, watch for
+// a TDR (Event 4101) or process crash, and step down 15 MHz on failure.
+func cmdTest(args []string) error {
+	fs := flag.NewFlagSet("test", flag.ExitOnError)
+	voltage := fs.Float64("voltage", 0, "target voltage (mV)")
+	freq := fs.Float64("freq", 0, "starting frequency (MHz)")
+	minFreq := fs.Float64("min-freq", 0, "stop stepping down below this (MHz)")
+	game := fs.String("game", "", "path to the benchmark/game executable")
+	gameArgs := fs.String("game-args", "", "arguments for the game (space-separated)")
+	runFor := fs.Duration("run-for", 30*time.Minute, "clean run required before declaring stable")
+	maxSteps := fs.Int("max-steps", 10, "max step-down attempts (15 MHz each)")
+	rampFrom := fs.Float64("ramp-from", 850, "ramp start voltage (mV)")
+	fs.Parse(args)
+
+	if *voltage == 0 || *freq == 0 || *game == "" {
+		return fmt.Errorf("--voltage, --freq, and --game are required")
+	}
+	if *minFreq == 0 {
+		*minFreq = *freq - float64(*maxSteps)*15
+	}
+
+	for step := 0; ; step++ {
+		f := *freq - float64(step)*15
+		if f < *minFreq {
+			return fmt.Errorf("stepped down to %.0f MHz (below --min-freq) with no stable result", f)
+		}
+		fmt.Printf("\n=== attempt %d: %.0f MHz @ %.0f mV ===\n", step, f, *voltage)
+		if err := applyCurve(*voltage, f, *rampFrom); err != nil {
+			return err
+		}
+
+		baseline, err := countTDR()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: cannot read TDR event log: %v (crash detection disabled)\n", err)
+		}
+
+		cmd := exec.Command(*game, strings.Fields(*gameArgs)...)
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("launch %s: %w", *game, err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+
+		deadline := time.NewTimer(*runFor)
+		tick := time.NewTicker(2 * time.Second)
+
+		var outcome string // "stable" | "exit-clean" | "exit-crash" | "tdr"
+		for outcome == "" {
+			select {
+			case err := <-done:
+				if err == nil {
+					outcome = "exit-clean"
+				} else {
+					outcome = "exit-crash"
+				}
+			case <-deadline.C:
+				outcome = "stable"
+			case <-tick.C:
+				if n, e := countTDR(); e == nil && baseline >= 0 && n > baseline {
+					cmd.Process.Kill()
+					outcome = "tdr"
+				}
+			}
+		}
+		tick.Stop()
+		deadline.Stop()
+
+		switch outcome {
+		case "stable":
+			fmt.Printf("\nSTABLE: %.0f MHz @ %.0f mV survived %s with no TDR\n", f, *voltage, *runFor)
+			return nil
+		case "exit-clean":
+			fmt.Printf("clean exit at %.0f MHz @ %.0f mV\n", f, *voltage)
+			return nil
+		case "tdr", "exit-crash":
+			fmt.Printf("%s at %.0f MHz - stepping down 15 MHz\n", outcome, f)
+		}
+	}
 }
