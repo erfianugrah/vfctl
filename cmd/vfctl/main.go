@@ -438,6 +438,16 @@ func cmdSet(args []string) error {
 		return err
 	}
 
+	// Self-clean: zero any stale non-zero offsets below the ramp region so
+	// switching curves never stacks old offsets (the notch bug). Every `set`
+	// produces a clean curve regardless of what's currently on the card.
+	for _, p := range points {
+		mv := float64(p.VoltageUV) / 1000
+		if mv < *rampFrom && p.OffsetKHz != 0 {
+			offsets[p.Index] = 0
+		}
+	}
+
 	if *dryRun {
 		fmt.Printf("\nWould set %d points (dry run)\n", len(offsets))
 		for _, p := range points {
