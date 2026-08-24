@@ -64,6 +64,8 @@ func main() {
 		err = cmdPersist(args)
 	case "test":
 		err = cmdTest(args)
+	case "selftest":
+		err = cmdSelfTest(args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", cmd)
 		usage()
@@ -97,6 +99,7 @@ Commands:
             Install a scheduled task that re-applies the curve at sign-in (admin)
   test      --voltage 900 --freq 2812 --game path.exe [--min-freq N] [--run-for 30m]
             Apply, launch the game, watch for TDR; step down 15 MHz on crash (admin)
+  selftest  Prove the write path: +15 MHz on one point, read back, reset (admin)
 `)
 }
 
@@ -489,6 +492,9 @@ func cmdReset(args []string) error {
 	if err := sess.SetAllOffsets(resets); err != nil {
 		return err
 	}
+	if err := verifyOffsets(sess, resets); err != nil {
+		return fmt.Errorf("reset did not fully apply (reboot to return to stock, offsets are volatile): %w", err)
+	}
 	fmt.Println("Done - back to stock curve")
 	return nil
 }
@@ -505,6 +511,23 @@ func stockAt(points []nvapi.VFPoint, voltage float64) (float64, bool) {
 
 // buildOffsets computes per-point offsets (kHz) for a ramp-then-flatten curve.
 func buildOffsets(points []nvapi.VFPoint, voltage, freq, rampFrom float64) (map[int]int32, error) {
+	// Bounds guard: refuse values that would push the card outside any sane
+	// operating envelope. This is the catastrophic-typo check (freq 27970 instead
+	// of 2797) - it is not a tuning limit.
+	const (
+		minVolt     = 600.0  // mV
+		maxVolt     = 1300.0 // mV
+		minFreq     = 300.0  // MHz
+		maxFreq     = 4000.0 // MHz, above any 5090 clock
+		maxOffsetHz = 1500.0 // MHz, per-point offset ceiling
+	)
+	if voltage < minVolt || voltage > maxVolt {
+		return nil, fmt.Errorf("target voltage %.0f mV outside sane range [%.0f, %.0f]", voltage, minVolt, maxVolt)
+	}
+	if freq < minFreq || freq > maxFreq {
+		return nil, fmt.Errorf("target %.0f MHz outside sane range [%.0f, %.0f]", freq, minFreq, maxFreq)
+	}
+
 	stock, ok := stockAt(points, voltage)
 	if !ok {
 		return nil, fmt.Errorf("no VF point at %.0fmV", voltage)
@@ -522,12 +545,18 @@ func buildOffsets(points []nvapi.VFPoint, voltage, freq, rampFrom float64) (map[
 		default:
 			target = freq
 		}
-		offsets[p.Index] = int32((target - float64(p.FreqKHz)/1000) * 1000)
+		offset := target - float64(p.FreqKHz)/1000
+		if offset > maxOffsetHz || offset < -maxOffsetHz {
+			return nil, fmt.Errorf("offset %+.0f MHz at %.0fmV exceeds ceiling ±%.0f MHz (base %.0f MHz)", offset, mv, maxOffsetHz, float64(p.FreqKHz)/1000)
+		}
+		offsets[p.Index] = int32(offset * 1000)
 	}
 	return offsets, nil
 }
 
-// applyCurve opens NVAPI, reads the live curve, and writes the offsets.
+// applyCurve opens NVAPI, reads the live curve, writes the offsets, then reads
+// back and verifies they landed. A write that does not verify is an error - the
+// card may be in an unknown state, and the caller must not assume success.
 func applyCurve(voltage, freq, rampFrom float64) error {
 	sess, err := nvapi.Init()
 	if err != nil {
@@ -543,7 +572,48 @@ func applyCurve(voltage, freq, rampFrom float64) error {
 		return err
 	}
 	fmt.Printf("applying %.0f MHz @ %.0f mV (%d points)...\n", freq, voltage, len(offsets))
-	return sess.SetAllOffsets(offsets)
+	if err := sess.SetAllOffsets(offsets); err != nil {
+		return err
+	}
+	return verifyOffsets(sess, offsets)
+}
+
+// verifyOffsets re-reads the live curve and checks every written offset landed
+// within one 15 MHz step. Returns a formatted error listing mismatches.
+func verifyOffsets(sess *nvapi.Session, want map[int]int32) error {
+	after, err := sess.ReadCurve()
+	if err != nil {
+		return fmt.Errorf("read-back after write failed: %w", err)
+	}
+	got := make(map[int]int32, len(after))
+	for _, p := range after {
+		got[p.Index] = p.OffsetKHz
+	}
+	const tol = 15000 // one 15 MHz step, in kHz
+	var mismatches []string
+	for idx, w := range want {
+		g, present := got[idx]
+		if !present {
+			mismatches = append(mismatches, fmt.Sprintf("point %d: missing after write", idx))
+			continue
+		}
+		if abs64(int64(g)-int64(w)) > tol {
+			mismatches = append(mismatches, fmt.Sprintf("point %d: want %+d kHz, got %+d kHz", idx, w, g))
+		}
+	}
+	if len(mismatches) > 0 {
+		return fmt.Errorf("write verification failed: %d/%d points mismatch:\n  %s",
+			len(mismatches), len(want), strings.Join(mismatches, "\n  "))
+	}
+	fmt.Printf("verified: %d points applied and read back correctly\n", len(want))
+	return nil
+}
+
+func abs64(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 // cmdPersist installs (or removes) a scheduled task that re-applies the curve
@@ -605,7 +675,82 @@ func countTDR() (int, error) {
 	return n, nil
 }
 
-// cmdTest automates stability search: apply a curve, launch the game, watch for
+// cmdSelfTest proves the NVAPI write path end-to-end on the live card without
+// touching the operating curve: it writes +15 MHz (one step) to a single
+// mid-range point, reads it back, then restores the original offset. This is
+// the one-shot gate for "can we ditch Afterburner" - if it passes, the write
+// path and struct layout are correct; if it fails, do not trust `set`.
+func cmdSelfTest(args []string) error {
+	sess, err := nvapi.Init()
+	if err != nil {
+		return err
+	}
+	defer sess.Close()
+	fmt.Printf("GPU: %s\n", sess.GPUName())
+
+	points, err := sess.ReadCurve()
+	if err != nil {
+		return err
+	}
+
+	// Pick a mid-range point (nearest 900 mV) as the probe.
+	var probe nvapi.VFPoint
+	best := 1e9
+	for _, p := range points {
+		mv := float64(p.VoltageUV) / 1000
+		if d := absF(mv - 900); d < best {
+			best = d
+			probe = p
+		}
+	}
+	if probe.Index == 0 && probe.VoltageUV == 0 {
+		return fmt.Errorf("no probe point found")
+	}
+
+	orig := probe.OffsetKHz
+	fmt.Printf("probe point %d @ %.0f mV: current offset %+d kHz\n", probe.Index, float64(probe.VoltageUV)/1000, orig)
+	fmt.Printf("writing +15 MHz (one step) to that point only...\n")
+
+	if err := sess.SetOffset(probe.Index, orig+15000); err != nil {
+		return fmt.Errorf("single-point write failed (write path is NOT verified): %w", err)
+	}
+
+	after, err := sess.ReadCurve()
+	if err != nil {
+		return fmt.Errorf("read-back failed: %w", err)
+	}
+	var got int32
+	found := false
+	for _, p := range after {
+		if p.Index == probe.Index {
+			got = p.OffsetKHz
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("probe point %d missing from read-back", probe.Index)
+	}
+	if int64(got)-int64(orig) != 15000 {
+		return fmt.Errorf("read-back mismatch: wrote %+d kHz, read %+d kHz", orig+15000, got)
+	}
+
+	fmt.Printf("read-back confirmed: %+d kHz (was %+d)\n", got, orig)
+	fmt.Printf("restoring original offset...\n")
+	if err := sess.SetOffset(probe.Index, orig); err != nil {
+		return fmt.Errorf("restore failed (reboot returns to stock; offsets are volatile): %w", err)
+	}
+
+	fmt.Println("SELFTEST PASSED: write path is verified. `set` is safe to use.")
+	return nil
+}
+
+func absF(f float64) float64 {
+	if f < 0 {
+		return -f
+	}
+	return f
+}
 // a TDR (Event 4101) or process crash, and step down 15 MHz on failure.
 func cmdTest(args []string) error {
 	fs := flag.NewFlagSet("test", flag.ExitOnError)
