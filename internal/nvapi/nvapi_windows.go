@@ -220,10 +220,12 @@ func (s *Session) loadMask() error {
 }
 
 // activeIndices returns the point indices set in the active-point mask.
+// The mask is 32 bytes (8 x uint32 little-endian). Bit i lives in
+// word i/32, bit position i%32.
 func (s *Session) activeIndices() []int {
 	idx := make([]int, 0, pointCount)
 	for i := 0; i < pointCount; i++ {
-		word := binary.LittleEndian.Uint32(s.mask[i/8*4 : i/8*4+4])
+		word := binary.LittleEndian.Uint32(s.mask[(i/32)*4 : (i/32)*4+4])
 		if word&(1<<(uint(i)%32)) != 0 {
 			idx = append(idx, i)
 		}
