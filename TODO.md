@@ -12,28 +12,31 @@
 - [x] Core-domain filter (excludes memory/other clock domains)
 - [x] Base-frequency field (vf_tuple_base, not nominal)
 - [x] `set` verifies read-back (parity with reset)
-- [x] `watch` telemetry: live core/mem clock + voltage + offset, CSV log
+- [x] `set` self-cleans stale offsets below ramp (curve switching safe)
+- [x] `watch` telemetry: core/mem clock + voltage + offset, CSV log
+- [x] Full telemetry: utilization, temperature, power (live draw)
+- [x] `--summary` voltage histogram on exit
+- [x] `persist` sign-in scheduled task
+- [x] Full gaming session verified: 2812@900, 76W avg, 61C max, zero crashes
+- [x] Lexicanum reference page
 
-## Now (the load-test gate)
-- [ ] Load the card, confirm it clocks to 2812 MHz @ 900 mV under load
-  (not 1406 - the half-step x2 question). `vfctl watch --csv out.csv`
-- [ ] If half: fix x2 multiplier, re-verify
-- [ ] Confirm 2812@900 stable in The Finals (NVAPI-applied, not Afterburner cfg)
-- [ ] Then: uninstall Afterburner
+## Next (see docs/plans/afterburner-coverage.md)
+- [ ] **Pstates20 reader** - dump pstates/clocks/delta-ranges (scouts
+      memory + core + voltage offset in one read-only step)
+- [ ] Memory clock offset via Pstates20 + selftest-mem (the perf win)
+- [ ] Core clock offset (flat, Pstates20)
+- [ ] Core voltage offset (uV, Pstates20)
+- [ ] Power limit % (only if memory OC needs it)
+- [ ] Perf-limit flags in watch telemetry (PerfPoliciesGetStatus)
 
-## Next (full coverage - see docs/plans/afterburner-coverage.md)
-- [ ] Memory clock offset (independent perf axis)
-- [ ] Power limit % (temps/noise)
-- [ ] Temp limit C
-- [ ] Core voltage offset (redundant with curve, for OC)
-- [ ] Overvoltage +100mV (highest risk, last)
-
-## Maybe later
+## Investigate later
+- [ ] TDR recovery: do offsets survive a TDR? (persist model assumes not)
+- [ ] Step-up ceiling search mode for `test`
 - [ ] JSON profile store (named curves, applied via NVAPI)
-- [ ] Auto step-down on failure integrated with `test`
-- [ ] Import existing Afterburner profiles into JSON store
 - [ ] CI: Windows cross-compile + test on release tag
 
 ## Not doing
 - Fan control (NVIDIA clamps manual to 30% min; 0 RPM is vBIOS-auto only; FanControl already optimal)
 - Linux NVML path (global offset only, no per-point curves)
+- Overvoltage +100mV (highest risk, zero value for the goals)
+- Temp limit (card never exceeds 61C; the limit never engages)
