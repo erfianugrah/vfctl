@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
@@ -646,6 +647,7 @@ func cmdWatch(args []string) error {
 	fs := flag.NewFlagSet("watch", flag.ExitOnError)
 	interval := fs.Duration("interval", time.Second, "poll interval")
 	csvPath := fs.String("csv", "", "write CSV samples to this file (default: stdout only)")
+	summary := fs.Bool("summary", false, "print a voltage histogram on exit (Ctrl+C)")
 	fs.Parse(args)
 
 	sess, err := nvapi.Init()
@@ -680,8 +682,24 @@ func cmdWatch(args []string) error {
 	fmt.Printf("%8s %9s %9s %8s %9s\n", "elapsed", "core MHz", "volt mV", "point mV", "offset MHz")
 	fmt.Println(strings.Repeat("-", 48))
 
+	// Per-voltage histogram accumulation (when --summary).
+	buckets := make(map[int]*summaryBucket)
+	var totalSamples int
+
+	// SIGINT -> clean summary on exit.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	defer signal.Stop(sig)
+
 	start := time.Now()
+loop:
 	for {
+		select {
+		case <-sig:
+			break loop
+		default:
+		}
+
 		sample := time.Now()
 		clk, clkErr := sess.ReadClocks()
 		volt, voltErr := sess.ReadVoltage()
@@ -720,6 +738,26 @@ func cmdWatch(args []string) error {
 				float64(nearest.OffsetKHz)/1000)
 		}
 
+		// Accumulate for summary.
+		if *summary && clkErr == nil && voltErr == nil {
+			mv := int(volt / 1000)
+			b, ok := buckets[mv]
+			if !ok {
+				b = &summaryBucket{coreMin: 1e9}
+				buckets[mv] = b
+			}
+			b.n++
+			totalSamples++
+			c := float64(clk.CoreKHz) / 1000
+			if c < b.coreMin {
+				b.coreMin = c
+			}
+			if c > b.coreMax {
+				b.coreMax = c
+			}
+			b.coreSum += c
+		}
+
 		// CSV row.
 		if w != nil {
 			row := []string{
@@ -739,6 +777,43 @@ func cmdWatch(args []string) error {
 		}
 
 		time.Sleep(*interval)
+	}
+
+	if w != nil {
+		w.Flush()
+	}
+	if *summary {
+		printSummary(buckets, totalSamples, start)
+	}
+	return nil
+}
+
+// summaryBucket accumulates one voltage bucket's clock stats.
+type summaryBucket struct {
+	n       int
+	coreMin float64
+	coreMax float64
+	coreSum float64
+}
+
+// printSummary renders the per-voltage histogram accumulated during watch.
+func printSummary(buckets map[int]*summaryBucket, total int, start time.Time) {
+	if total == 0 {
+		fmt.Println("\nno samples to summarize")
+		return
+	}
+	volts := make([]int, 0, len(buckets))
+	for v := range buckets {
+		volts = append(volts, v)
+	}
+	sort.Ints(volts)
+	fmt.Printf("\n=== summary (%d samples, %s) ===\n", total, time.Since(start).Round(time.Second))
+	fmt.Printf("%8s %8s %9s %9s %9s\n", "volt mV", "samples", "pct", "core min", "core avg")
+	fmt.Println(strings.Repeat("-", 46))
+	for _, v := range volts {
+		b := buckets[v]
+		fmt.Printf("%8d %8d %8.1f%% %9.0f %9.0f\n",
+			v, b.n, float64(b.n)*100/float64(total), b.coreMin, b.coreSum/float64(b.n))
 	}
 }
 
