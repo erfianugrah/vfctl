@@ -1,25 +1,29 @@
 # vfctl
 
-GPU voltage/frequency curve tool for NVIDIA cards. Two modes:
+GPU voltage/frequency curve tool for NVIDIA cards. Bypasses MSI Afterburner's broken curve editor.
 
-1. **Afterburner cfg editing** (Linux/WSL) - generate and write VFCurve hex to profile files
-2. **NVAPI direct** (Windows, requires admin) - read/write curves directly via NVIDIA driver
+Two modes:
+- **NVAPI direct** (Windows, admin) - read/write curves directly via NVIDIA driver
+- **Afterburner cfg** (Linux/WSL) - generate and write VFCurve hex to profile files
 
-Built for an RTX 5090 FE after Afterburner's editor repeatedly produced broken curves.
+Built for an RTX 5090 FE after Afterburner's editor repeatedly produced broken curves (notch artifacts, temperature-stale baselines).
 
-## Quick Start (Windows, Direct)
+## Quick Start (Windows)
+
+**Run as Administrator:**
 
 ```powershell
-# Run as Administrator
-
 # Check what APIs are available
 .\vfctl.exe probe
 
-# Read live curve from GPU
+# Read live curve from GPU (safe, no admin needed)
 .\vfctl.exe live --min-mv 880 --max-mv 950
 
 # Apply undervolt: 2797MHz @ 900mV
 .\vfctl.exe set --voltage 900 --freq 2797
+
+# Preview without applying
+.\vfctl.exe set --voltage 900 --freq 2797 --dry-run
 
 # Reset to stock
 .\vfctl.exe reset
@@ -49,14 +53,14 @@ vfctl hex --voltage 900 --freq 2797
 
 ## How it works
 
-### Direct NVAPI (Windows)
-- Reads live VF curve from GPU via undocumented NVAPI calls
-- Computes per-point offsets against the live baseline (temperature-correct)
-- Writes offsets via `ClockClientClkVfPointsSetControl` (Blackwell) or `ClockBoostTable` (pre-Blackwell)
-- No Afterburner needed, no stale config files
+### NVAPI direct (Windows)
+- Reads live VF curve via undocumented NVAPI calls
+- Computes offsets against the **live** baseline (temperature-correct)
+- Writes via `ClockClientClkVfPointsSetControl` (Blackwell) or `ClockBoostTable` (pre-Blackwell)
+- No Afterburner needed, no stale config
 
 ### Afterburner cfg (Linux/WSL)
-- Parses VFCurve hex blobs from profile files
+- Parses VFCurve hex blobs (12-byte header, 127 points)
 - Generates smooth undervolt curves (ramp + flatten)
 - Validates for notches/discontinuities before writing
 - Writes to `C:\Program Files (x86)\MSI Afterburner\Profiles\*.cfg`
@@ -73,7 +77,7 @@ GOOS=windows go build -o vfctl.exe ./cmd/vfctl
 
 ## Notes
 
-- **Write requires Administrator** on Windows (NVAPI_INVALID_USER_PRIVILEGE)
+- **Write requires Administrator** (error -137 = `NVAPI_INVALID_USER_PRIVILEGE`)
 - NVIDIA snaps frequencies to 15MHz steps
 - The base curve shifts with temperature - the tool reads live values when applying
 - Fan control is out of scope (hardware clamps manual to 30% min, 0 RPM is vBIOS-auto only)
