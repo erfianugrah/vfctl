@@ -14,11 +14,13 @@
 package main
 
 import (
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,6 +69,8 @@ func main() {
 		err = cmdTest(args)
 	case "selftest":
 		err = cmdSelfTest(args)
+	case "watch":
+		err = cmdWatch(args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", cmd)
 		usage()
@@ -101,6 +105,7 @@ Commands:
   test      --voltage 900 --freq 2812 --game path.exe [--min-freq N] [--run-for 30m]
             Apply, launch the game, watch for TDR; step down 15 MHz on crash (admin)
   selftest  Prove the write path: +15 MHz on one point, read back, reset (admin)
+  watch     Poll core clock + voltage + nearest VF point every second (load test)
 `)
 }
 
@@ -367,6 +372,10 @@ func cmdLive(args []string) error {
 	if err == nil {
 		fmt.Printf("Current voltage: %.0f mV\n", float64(volt)/1000)
 	}
+	clk, err := sess.ReadClocks()
+	if err == nil {
+		fmt.Printf("Core clock: %.0f MHz | Memory: %.0f MHz\n", float64(clk.CoreKHz)/1000, float64(clk.MemoryKHz)/1000)
+	}
 
 	points, err := sess.ReadCurve()
 	if err != nil {
@@ -626,6 +635,111 @@ func cmdSelfTest(args []string) error {
 
 	fmt.Println("SELFTEST PASSED: write path is verified. `set` is safe to use.")
 	return nil
+}
+
+// cmdWatch polls core clock, voltage, and the nearest VF point on an interval
+// and logs every sample to a CSV file (plus stdout). This is the load-test
+// telemetry: run it while a game/benchmark loads the GPU and confirm the card
+// reaches target clock at target voltage - and capture the full time series
+// (clock, voltage, spikes, read errors) for later analysis with mlr/duckdb.
+func cmdWatch(args []string) error {
+	fs := flag.NewFlagSet("watch", flag.ExitOnError)
+	interval := fs.Duration("interval", time.Second, "poll interval")
+	csvPath := fs.String("csv", "", "write CSV samples to this file (default: stdout only)")
+	fs.Parse(args)
+
+	sess, err := nvapi.Init()
+	if err != nil {
+		return err
+	}
+	defer sess.Close()
+
+	// CSV writer (append-safe: truncate + header on a fresh open).
+	var w *csv.Writer
+	var fh *os.File
+	if *csvPath != "" {
+		fh, err = os.OpenFile(*csvPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+		if err != nil {
+			return fmt.Errorf("open csv: %w", err)
+		}
+		defer fh.Close()
+		w = csv.NewWriter(fh)
+		if err := w.Write([]string{
+			"unix_ns", "elapsed", "core_mhz", "mem_mhz", "volt_mv",
+			"point_mv", "offset_mhz", "read_error",
+		}); err != nil {
+			return err
+		}
+		w.Flush()
+	}
+
+	fmt.Printf("GPU: %s\n", sess.GPUName())
+	if *csvPath != "" {
+		fmt.Printf("logging to %s\n", *csvPath)
+	}
+	fmt.Printf("%8s %9s %9s %8s %9s\n", "elapsed", "core MHz", "volt mV", "point mV", "offset MHz")
+	fmt.Println(strings.Repeat("-", 48))
+
+	start := time.Now()
+	for {
+		sample := time.Now()
+		clk, clkErr := sess.ReadClocks()
+		volt, voltErr := sess.ReadVoltage()
+
+		// Nearest VF point to current voltage, for the applied offset.
+		var nearest nvapi.VFPoint
+		best := 1e9
+		points, _ := sess.ReadCurve()
+		for _, p := range points {
+			d := float64(p.VoltageUV)/1000 - float64(volt)/1000
+			if d < 0 {
+				d = -d
+			}
+			if d < best {
+				best = d
+				nearest = p
+			}
+		}
+
+		readErr := ""
+		if clkErr != nil {
+			readErr = clkErr.Error()
+		} else if voltErr != nil {
+			readErr = voltErr.Error()
+		}
+
+		// Console line.
+		if clkErr != nil {
+			fmt.Printf("%8s %s\n", time.Since(start).Round(time.Second), clkErr)
+		} else {
+			fmt.Printf("%8s %9.0f %9.0f %8.0f %+9.0f\n",
+				time.Since(start).Round(time.Second),
+				float64(clk.CoreKHz)/1000,
+				float64(volt)/1000,
+				float64(nearest.VoltageUV)/1000,
+				float64(nearest.OffsetKHz)/1000)
+		}
+
+		// CSV row.
+		if w != nil {
+			row := []string{
+				strconv.FormatInt(sample.UnixNano(), 10),
+				strconv.FormatFloat(time.Since(start).Seconds(), 'f', 3, 64),
+				strconv.FormatFloat(float64(clk.CoreKHz)/1000, 'f', 1, 64),
+				strconv.FormatFloat(float64(clk.MemoryKHz)/1000, 'f', 1, 64),
+				strconv.FormatFloat(float64(volt)/1000, 'f', 1, 64),
+				strconv.FormatFloat(float64(nearest.VoltageUV)/1000, 'f', 0, 64),
+				strconv.FormatFloat(float64(nearest.OffsetKHz)/1000, 'f', 1, 64),
+				readErr,
+			}
+			if err := w.Write(row); err != nil {
+				return err
+			}
+			w.Flush()
+		}
+
+		time.Sleep(*interval)
+	}
 }
 
 // a TDR (Event 4101) or process crash, and step down 15 MHz on failure.

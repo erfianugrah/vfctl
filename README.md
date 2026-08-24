@@ -33,7 +33,35 @@ Built for an RTX 5090 FE after Afterburner's editor repeatedly produced broken c
 
 # Automate stability search: step down 15 MHz on each TDR
 .\vfctl.exe test --voltage 900 --freq 2812 --game "C:\path\to\game.exe" --min-freq 2700 --run-for 30m
+
+# Prove the write path (one-shot gate before trusting set)
+.\vfctl.exe selftest
+
+# Live telemetry: core/mem clock + voltage + offset, CSV log
+.\vfctl.exe watch --csv C:\path\to\out.csv
 ```
+
+## Telemetry (watch)
+
+`watch` polls the live core clock, memory clock, voltage, and the nearest VF
+point every interval (default 1s) and writes every sample to a CSV file. This
+replaces HWiNFO/overlay for the load-test verification step - run it while a
+game loads the GPU and confirm the card reaches the target clock at the target
+voltage.
+
+```powershell
+.\vfctl.exe watch --csv watch.csv --interval 500ms
+```
+
+CSV columns: `unix_ns, elapsed, core_mhz, mem_mhz, volt_mv, point_mv,
+offset_mhz, read_error`. Analyze with mlr/duckdb:
+
+```bash
+duckdb -c "SELECT min(core_mhz), max(core_mhz), avg(volt_mv) FROM 'watch.csv'"
+```
+
+Note: `mem_mhz` reports the physical GDDR7 clock; its exact domain value is not
+yet cross-checked against a known-good reading.
 
 ## Persistence
 
@@ -67,12 +95,10 @@ without a TDR, or at `--min-freq`.
 
 ## Telemetry (HWiNFO)
 
-The crash loop needs no sensors - the TDR event IS the stability signal. Use
-HWiNFO for verification telemetry: confirm the card actually runs at the target
-voltage/frequency under load and check hotspot temperature. Enable Shared
-Memory Support and CSV-log during a session (green + button), then compare
-against the curve. Note: shared-memory access is time-limited on the free
-version (12 hours); a Pro license lifts it.
+`watch` (above) replaces HWiNFO for the load-test verification - it reads the
+live core clock, memory clock, voltage, and applied offset directly via NVAPI
+and logs to CSV. Use HWiNFO only if you want additional sensors (hotspot temp,
+power draw, fan RPM) that NVAPI's clock/voltage read doesn't expose.
 
 ## Afterburner cfg mode (Linux/WSL)
 

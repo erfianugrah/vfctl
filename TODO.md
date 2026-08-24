@@ -6,26 +6,32 @@
 - [x] Undervolt generator (ramp + flatten) with validation
 - [x] CLI: list / show / validate / create / apply / hex
 - [x] NVAPI layer: probe, live curve read, per-point offset write
-- [x] CLI: probe / live / set / reset (NVAPI direct, Windows)
+- [x] CLI: probe / live / set / reset / selftest (NVAPI direct, Windows)
 - [x] Error message lookup (NVAPI_GetErrorMessage)
-- [x] Verified live on RTX 5090 FE: probe + live read + write attempt
-- [x] Identified admin requirement for writes (-137 = NVAPI_INVALID_USER_PRIVILEGE)
+- [x] NVAPI write path verified (selftest: +15000 read back +15000)
+- [x] Core-domain filter (excludes memory/other clock domains)
+- [x] Base-frequency field (vf_tuple_base, not nominal)
+- [x] `set` verifies read-back (parity with reset)
+- [x] `watch` telemetry: live core/mem clock + voltage + offset, CSV log
 
-## Now (stability testing)
-- [ ] Confirm 2812MHz @ 900mV (Profile3) stable in The Finals
-- [ ] If crash: Profile4 (2797) or `vfctl set --voltage 900 --freq 2797`
-- [ ] If stable: consider 890mV at same clock for lower temps
+## Now (the load-test gate)
+- [ ] Load the card, confirm it clocks to 2812 MHz @ 900 mV under load
+  (not 1406 - the half-step x2 question). `vfctl watch --csv out.csv`
+- [ ] If half: fix x2 multiplier, re-verify
+- [ ] Confirm 2812@900 stable in The Finals (NVAPI-applied, not Afterburner cfg)
+- [ ] Then: uninstall Afterburner
 
-## Next (NVAPI polish)
-- [ ] Verify write path with admin rights (blocked on user running elevated)
-- [ ] Read-back verification after set (compare offsets post-write)
-- [ ] Auto step-down on failure: apply, if write fails midway, reset
-- [ ] JSON profile store (named undervolt profiles, applied via NVAPI)
-- [ ] `--watch` mode: live voltage/freq/temp polling for stability monitoring
+## Next (full coverage - see docs/plans/afterburner-coverage.md)
+- [ ] Memory clock offset (independent perf axis)
+- [ ] Power limit % (temps/noise)
+- [ ] Temp limit C
+- [ ] Core voltage offset (redundant with curve, for OC)
+- [ ] Overvoltage +100mV (highest risk, last)
 
 ## Maybe later
+- [ ] JSON profile store (named curves, applied via NVAPI)
+- [ ] Auto step-down on failure integrated with `test`
 - [ ] Import existing Afterburner profiles into JSON store
-- [ ] VFCDump diffing (Ctrl+F5) to understand apply-time behavior
 - [ ] CI: Windows cross-compile + test on release tag
 
 ## Not doing

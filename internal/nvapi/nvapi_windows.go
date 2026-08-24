@@ -415,6 +415,46 @@ func (s *Session) ReadVoltage() (uint32, error) {
 	return binary.LittleEndian.Uint32(buf[0x28:]), nil
 }
 
+// CurrentClocks holds the current core and memory clock frequencies.
+type CurrentClocks struct {
+	CoreKHz   uint32
+	MemoryKHz uint32
+}
+
+// ReadClocks reads the current core (graphics) and memory clock frequencies
+// via NvAPI_GPU_GetAllClockFrequencies (0xDCB616C3). This is a DOCUMENTED
+// public NVAPI (docs.nvidia.com/nvapi, Release 590), not reverse-engineered.
+//
+// Struct NV_GPU_CLOCK_FREQUENCIES_V2:
+//
+//	version   u32 @ 0x00  (MAKE_NVAPI_VERSION(V2, 2))
+//	ClockType u32 @ 0x04  (0 = CURRENT_FREQ)
+//	domain[32] struct { bIsPresent:1, reserved:31 u32; frequency u32 } @ 0x08
+//	GRAPHICS = domain[0], MEMORY = domain[4]
+func (s *Session) ReadClocks() (CurrentClocks, error) {
+	const (
+		idGetAllClockFrequencies = 0xDCB616C3
+		clockTypeCurrent         = 0
+		domainGraphics           = 0
+		domainMemory             = 4
+		clockFreqDomainSize      = 8 // u32 flags + u32 frequency
+	)
+	fn, err := queryInterface(idGetAllClockFrequencies)
+	if err != nil {
+		return CurrentClocks{}, err
+	}
+	buf := make([]byte, 0x108) // 8 + 32*8
+	binary.LittleEndian.PutUint32(buf[0:], makeVersion(2, 0x108))
+	binary.LittleEndian.PutUint32(buf[4:], clockTypeCurrent)
+	if ret, _ := call(fn, uintptr(s.gpu), uintptr(unsafe.Pointer(&buf[0]))); ret != NVAPI_OK {
+		return CurrentClocks{}, fmt.Errorf("GetAllClockFrequencies failed: %d (%s)", ret, errorText(ret))
+	}
+	freq := func(domain int) uint32 {
+		return binary.LittleEndian.Uint32(buf[8+domain*clockFreqDomainSize+4:])
+	}
+	return CurrentClocks{CoreKHz: freq(domainGraphics), MemoryKHz: freq(domainMemory)}, nil
+}
+
 // errorText looks up an NVAPI error message.
 func errorText(status int32) string {
 	fn, err := queryInterface(idGetErrorMessage)

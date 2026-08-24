@@ -41,3 +41,13 @@ func (s *Session) SetAllOffsets(offsets map[int]int32) error {
 func (s *Session) ReadVoltage() (uint32, error) {
 	return 0, fmt.Errorf("nvapi: only available on Windows")
 }
+
+// CurrentClocks holds the current core and memory clock frequencies.
+type CurrentClocks struct {
+	CoreKHz   uint32
+	MemoryKHz uint32
+}
+
+func (s *Session) ReadClocks() (CurrentClocks, error) {
+	return CurrentClocks{}, fmt.Errorf("nvapi: only available on Windows")
+}
