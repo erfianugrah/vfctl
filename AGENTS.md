@@ -31,28 +31,47 @@ testdata/                 Real curves captured from the 5090 FE (stock, broken)
 - **NVAPI read works without admin** (probe, live, read voltage).
 - Fan: manual fan % clamps to 30% minimum on NVIDIA; 0 RPM only via vBIOS auto mode. No fan control in this tool - FanControl handles it as well as the hardware allows.
 
-## NVAPI structs (from PenguinBurner hidden_nvapi_vf.py)
+## NVAPI structs (from PenguinBurner hidden_nvapi_vf.py, verified via ctypes)
+
+Three structs, all using the SAME 255-point index space and the active-point
+mask read from GetInfo (0x507B4B59). Do not mix generations: the status is v3
+(255 pts), the control is v1 (255 pts), the info is v1 (255 pts).
 
 ```
-ClkVfPointsStatusV1 (read):
-  version: u32 = (1 << 16) | 0x1C28
-  mask: u8[16] at 0x04 (all 0xFF)
-  numClocks: u32 at 0x14 = 15
-  points: 128 x 28 bytes at 0x48
-    +0x00: freq_kHz (u32)
-    +0x04: voltage_uV (u32)
-    +0x08: reserved[20]
+InfoV1 (0x507B4B59) - active mask + point types:
+  size 0x182C (6188)
+  vf_points_mask: u32[8] at 0x04
+  points: 255 x 24 bytes at 0x44
+    +0x00: type (u32)
+    +0x04: b_voltage_based (u8)
 
-ClkVfPointsControlV1 (write):
-  version: u32 = (1 << 16) | 0x2420
-  vf_points_mask: u32[8] at 0x04 (single bit set)
-  rsvd: u8[32] at 0x24
-  points: 255 x 36 bytes at 0x48
+StatusV3 (0x21537AD4) - freq/voltage, version 3:
+  size 0x15B0C (88844)
+  vf_points_mask: u32[8] at 0x04
+  points: 255 x 348 bytes at 0x68
+    +0x00: type (u32)
+    +0x04: freq_kHz (u32)
+    +0x08: voltage_uV (u32)
+    +0x0C: vf_tuple_base, +0x34: vf_tuple_offset
+
+ControlV1 (0x23F1B133 read / 0x0733E009 write) - offsets:
+  size 0x2420 (9248)
+  vf_points_mask: u32[8] at 0x04
+  points: 255 x 36 bytes at 0x44
     +0x00: type (u32)
     +0x04: rsvd[16]
-    +0x14: prog.freq_offset_kHz (i32)
-    +0x18: rsvd[16]
+    +0x14: prog.freq_offset_kHz (i32)   <-- 0x44 + i*36 + 20
 ```
+
+Write flow is READ-MODIFY-WRITE: GetControl fills type_/rsvd for all points,
+then change one freq_offset_kHz, then SetControl writes the whole table back
+with the full active mask. A fresh zeroed buffer does NOT stick (driver ignores
+writes to points whose type_ doesn't match what it returned).
+
+The earlier 0x48 base and 128-point/28-byte layout came from Loong0x00's
+read-only PoC, which reused the status stride for the control read and never
+exercised a write - the 4-byte error only surfaced once selftest actually
+attempted a write.
 
 ## Commands
 
